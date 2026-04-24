@@ -1,11 +1,10 @@
 import argparse
 import csv
-import json
 import math
 import os
 import random
 import time
-
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
@@ -103,37 +102,22 @@ def manual_cross_entropy(logits, targets):
     return (log_denominator - target_logits).mean()
 
 
-def batch_iter(corpus, window, batchsize, shuffle=False):
-    num_examples = corpus.numel() - window
-    if num_examples <= 0:
-        return
-
-    device = corpus.device
-    offsets = torch.arange(window, device=device).unsqueeze(0)
-
-    if shuffle:
-        order = torch.randperm(num_examples, device=device)
-        for start in range(0, num_examples, batchsize):
-            starts = order[start:start + batchsize]
-            contexts = corpus[starts.unsqueeze(1) + offsets]
-            targets = corpus[starts + window]
-            yield contexts, targets
-    else:
-        for start in range(0, num_examples, batchsize):
-            end = min(start + batchsize, num_examples)
-            starts = torch.arange(start, end, device=device)
-            contexts = corpus[starts.unsqueeze(1) + offsets]
-            targets = corpus[starts + window]
-            yield contexts, targets
-
-
 def evaluate(model, corpus, opt, split_name='valid'):
     model.eval()
     total_loss = 0.0
     total_words = 0
+    num_examples = corpus.numel() - opt.window
+    offsets = torch.arange(opt.window, device=opt.device).unsqueeze(0)
 
     with torch.no_grad():
-        for contexts, targets in batch_iter(corpus, opt.window, opt.eval_batchsize, shuffle=False):
+        for start in range(0, num_examples, opt.eval_batchsize):
+            end = min(start + opt.eval_batchsize, num_examples)
+            starts = torch.arange(start, end, device=opt.device)
+
+            # For each target word, grab the previous opt.window words.
+            contexts = corpus[starts.unsqueeze(1) + offsets]
+            targets = corpus[starts + opt.window]
+
             logits = model(contexts)
             loss = manual_cross_entropy(logits, targets)
             batch_words = targets.numel()
@@ -146,94 +130,34 @@ def evaluate(model, corpus, opt, split_name='valid'):
     return avg_loss, ppl
 
 
-def save_checkpoint(model, opt, epoch, train_ppl=None, valid_ppl=None, is_best=False):
-    if not opt.savename:
-        return
-
-    os.makedirs(opt.savename, exist_ok=True)
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': opt.optimizer.state_dict(),
-        'vocab': opt.vocab,
-        'words': opt.words,
-        'config': {
-            'threshold': opt.threshold,
-            'window': opt.window,
-            'd_model': opt.d_model,
-            'hidden_dim': opt.hidden_dim,
-            'batchsize': opt.batchsize,
-            'lr': opt.lr,
-        },
-        'train_ppl': train_ppl,
-        'valid_ppl': valid_ppl,
-    }
-
-    path = os.path.join(opt.savename, 'model_epoch_%03d.pt' % epoch)
-    torch.save(checkpoint, path)
-    torch.save(checkpoint, os.path.join(opt.savename, 'model_latest.pt'))
-    if is_best:
-        torch.save(checkpoint, os.path.join(opt.savename, 'model_best.pt'))
-
-
-def write_learning_curve(opt):
-    if not opt.savename or not opt.history:
-        return
-
-    os.makedirs(opt.savename, exist_ok=True)
-    csv_path = os.path.join(opt.savename, 'learning_curve.csv')
-    json_path = os.path.join(opt.savename, 'learning_curve.json')
-    png_path = os.path.join(opt.savename, 'learning_curve.png')
-
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['epoch', 'train_loss', 'train_ppl', 'valid_loss', 'valid_ppl'])
-        writer.writeheader()
-        writer.writerows(opt.history)
-
-    with open(json_path, 'w') as f:
-        json.dump(opt.history, f, indent=2)
-
-    try:
-        import matplotlib.pyplot as plt
-
-        epochs = [row['epoch'] for row in opt.history]
-        train_ppl = [row['train_ppl'] for row in opt.history]
-        valid_ppl = [row['valid_ppl'] for row in opt.history]
-
-        plt.figure()
-        plt.plot(epochs, train_ppl, label='train')
-        plt.plot(epochs, valid_ppl, label='valid')
-        plt.xlabel('epoch')
-        plt.ylabel('perplexity')
-        plt.title('Bengio LM learning curve')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(png_path)
-        plt.close()
-    except Exception:
-        pass
-
-
 def train(model,opt):
     train_corpus = torch.tensor(opt.train, dtype=torch.long, device=opt.device)
     valid_corpus = torch.tensor(opt.valid, dtype=torch.long, device=opt.device)
-    opt.history = []
+    history = []
 
     best_valid = float('inf')
     best_model_state = None
     epochs_without_improvement = 0
+    num_examples = train_corpus.numel() - opt.window
+    offsets = torch.arange(opt.window, device=opt.device).unsqueeze(0)
+
+    if opt.savename:
+        os.makedirs(opt.savename, exist_ok=True)
 
     for epoch in range(1, opt.epochs + 1):
         model.train()
         start_time = time.time()
         total_loss = 0.0
         total_words = 0
-        num_examples = max(train_corpus.numel() - opt.window, 1)
+        order = torch.randperm(num_examples, device=opt.device)
 
-        for batch_num, (contexts, targets) in enumerate(
-            batch_iter(train_corpus, opt.window, opt.batchsize, shuffle=True),
-            start=1,
-        ):
+        for start in range(0, num_examples, opt.batchsize):
+            batch_num = start // opt.batchsize + 1
+            starts = order[start:start + opt.batchsize]
+
+            contexts = train_corpus[starts.unsqueeze(1) + offsets]
+            targets = train_corpus[starts + opt.window]
+
             opt.optimizer.zero_grad(set_to_none=True)
             logits = model(contexts)
             loss = manual_cross_entropy(logits, targets)
@@ -265,14 +189,13 @@ def train(model,opt):
             % (epoch, train_loss, train_ppl, valid_loss, valid_ppl, elapsed)
         )
 
-        opt.history.append({
+        history.append({
             'epoch': epoch,
             'train_loss': train_loss,
             'train_ppl': train_ppl,
             'valid_loss': valid_loss,
             'valid_ppl': valid_ppl,
         })
-        write_learning_curve(opt)
 
         improved = valid_ppl < best_valid
         if improved:
@@ -285,7 +208,21 @@ def train(model,opt):
         else:
             epochs_without_improvement += 1
 
-        save_checkpoint(model, opt, epoch, train_ppl, valid_ppl, is_best=improved)
+        if opt.savename:
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': opt.optimizer.state_dict(),
+                'vocab': opt.vocab,
+                'words': opt.words,
+                'train_ppl': train_ppl,
+                'valid_ppl': valid_ppl,
+            }
+
+            torch.save(checkpoint, os.path.join(opt.savename, 'model_latest.pt'))
+            torch.save(checkpoint, os.path.join(opt.savename, 'model_epoch_%03d.pt' % epoch))
+            if improved:
+                torch.save(checkpoint, os.path.join(opt.savename, 'model_best.pt'))
 
         if opt.patience > 0 and epochs_without_improvement >= opt.patience:
             print('early stopping after %d epochs without validation improvement' % opt.patience)
@@ -294,6 +231,28 @@ def train(model,opt):
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print('restored best validation model with perplexity %.2f' % best_valid)
+
+    if opt.savename and len(history) > 0:
+        csv_path = os.path.join(opt.savename, 'learning_curve.csv')
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['epoch', 'train_loss', 'train_ppl', 'valid_loss', 'valid_ppl'])
+            writer.writeheader()
+            writer.writerows(history)
+
+        epochs = [row['epoch'] for row in history]
+        train_ppl = [row['train_ppl'] for row in history]
+        valid_ppl = [row['valid_ppl'] for row in history]
+
+        plt.figure()
+        plt.plot(epochs, train_ppl, label='train')
+        plt.plot(epochs, valid_ppl, label='valid')
+        plt.xlabel('epoch')
+        plt.ylabel('perplexity')
+        plt.title('Bengio LM learning curve')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(opt.savename, 'learning_curve.png'))
+        plt.close()
 
     return
 
